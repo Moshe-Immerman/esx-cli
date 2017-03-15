@@ -7,6 +7,10 @@ from optparse import OptionParser
 import click
 from datetime import datetime
 from colors import red, green, blue
+
+from colorama import init
+from termcolor import colored
+init()
 import paramiko
 import sys, traceback
 import cli
@@ -68,26 +72,12 @@ _password = None
 def cli(ctx, host, username, password):
 
     print "%s:%s@%s" % (username,'***', host)
-
-
     global _host
     _host = host
-
-    global esx
-    esx = connect.SmartConnect(host=host,
-                                        sslContext=_create_unverified_https_context(),
-                                        user=username,
-                                        pwd=password,
-                                        port=443)
-
-
-    content = esx.RetrieveContent()
-    print content.about.fullName
     global _user
     _user = username
     global _password
     _password = password
-    atexit.register(connect.Disconnect, esx)
 
 def get_datacenter():
     return esx.RetrieveContent().rootFolder.childEntity[0]
@@ -98,6 +88,7 @@ def get_resource_pool():
 
 def get_datastore_name(datastore):
     datastores = get_obj(vim.Datastore, datastore)
+    dat
     return datastores.name
     if len(datastores) == 1:
         datastore = datastores.keys()[0]
@@ -266,7 +257,7 @@ def clone_vm( vm):
         folder=template_vm.parent, name=name, spec=clonespec)
     wait(task, name)
 
-def ssh( cmd):
+def ssh(cmd, host=_host):
     ssh = paramiko.SSHClient()
     ssh.load_system_host_keys()
     ssh.connect(_host, username=_user, password=_password)
@@ -305,6 +296,123 @@ def wait(task, actionName='job', hideResult=False, breakOnError=False):
 def get_vmdk( vm):
     return vm.storage.perDatastoreUsage[0].datastore.info.url + "/" + vm.layout.disk[0].diskFile[0].split(" ")[1]
 
+
+def print_status_info(info):
+    if not hasattr(info, 'name'):
+        return
+    # print info
+    color = 'grey'
+    if (hasattr(info, 'healthState')):
+        color = info.healthState.key
+    if (hasattr(info, 'status')):
+        color = info.status.key
+
+    if 'unknown' in color:
+        color = 'grey'
+    desc = info.name
+    color = color.lower()
+    if 'green' in color:
+        return
+    if  hasattr(info, 'currentReading') and info.currentReading > 0:
+        desc += " %.0f %s" % (10 ** info.unitModifier * info.currentReading, info.baseUnits)
+    print colored(desc, color)
+
+
+def get_cpu_info(host):
+    cpuName = host.hardware.cpuPkg[0].description
+    cpuName = cpuName.replace('Intel(R) Xeon(R) CPU', '').replace(' ','')
+
+    stats = host.summary.quickStats
+    if stats.overallCpuUsage is None:
+        return colored(cpuName, 'red')
+    hardware = host.hardware
+    cpuTotal =  host.hardware.cpuPkg[0].hz / 1024 / 1024 * len(host.hardware.cpuPkg[0].threadId)
+    cpuUsage =  100 * stats.overallCpuUsage /  cpuTotal
+
+    return "%s %s" % (cpuName, get_colored_percent(cpuUsage, 2))
+
+
+def get_mem_info(host):
+    stats = host.summary.quickStats
+    memoryCapacity = host.hardware.memorySize
+    if stats.overallMemoryUsage is None:
+        return None
+    memoryUsage = stats.overallMemoryUsage * 1024 * 1024
+    percentage = (
+        (float(memoryUsage) / memoryCapacity) * 100
+    )
+    return "%s %s" % (format_space(memoryCapacity), get_colored_percent(percentage))
+
+def get_colored_percent(percentage, factor=1):
+    if percentage > 90/factor:
+        percentage = colored("%.0f%%" % percentage, 'red')
+    elif percentage > 70/factor:
+        percentage = colored("%.0f%%" % percentage, 'yellow')
+    else:
+        percentage = colored("%.0f%%" %  percentage, 'green')
+    return "@ %s" % (percentage)
+
+def get_tags(host):
+    desc = ""
+    for info in host.hardware.systemInfo.otherIdentifyingInfo:
+        if 'OemSpecificString' in info.identifierType.key or 'unknown' in  info.identifierValue:
+            continue
+        desc += info.identifierType.key + "=" + info.identifierValue + " "
+    return desc
+
+
+def get_esxi_hosts():
+    global esx
+    esxi_hosts = []
+    for host in _host.split(" "):
+        esx = connect.SmartConnect(host=host,
+                                        sslContext=_create_unverified_https_context(),
+                                        user=_user,
+                                        pwd=_password,
+                                        port=443)
+
+        content = esx.RetrieveContent()
+        esxi_hosts.append(content)
+    return esxi_hosts
+
+def get_host_view(content):
+    esx = content.viewManager.CreateContainerView(content.rootFolder,
+                                                         [vim.HostSystem],
+                                                         True).view
+    atexit.register(connect.Disconnect, esx)
+    return esx
+
+
+@cli.command()
+def status():
+    for content in get_esxi_hosts():
+        host = get_host_view(content)[0]
+        for health in host.runtime.healthSystemRuntime.systemHealthInfo.numericSensorInfo:
+            print_status_info(health)
+
+        print_status_info(host.runtime.healthSystemRuntime.hardwareStatusInfo.memoryStatusInfo[0])
+        print_status_info(host.runtime.healthSystemRuntime.hardwareStatusInfo.cpuStatusInfo[0])
+
+        print "%s (%s)\n\t%s\n\tCPU: %s\n\tRAM: %s" % (blue(host.name), content.about.fullName, get_tags(host), get_cpu_info(host), get_mem_info(host) )
+
+        datastores = content.viewManager.CreateContainerView(content.rootFolder,                                                         [vim.Datastore],                                                         True).view
+        for datastore in datastores:
+            summary = datastore.summary
+            ds_capacity = summary.capacity
+            ds_freespace = summary.freeSpace
+            ds_uncommitted = summary.uncommitted if summary.uncommitted else 0
+            ds_provisioned = ds_capacity - ds_freespace + ds_uncommitted
+            ds_used =  ds_capacity - ds_freespace
+            ds_overp = ds_provisioned - ds_capacity
+            ds_overp_pct = (ds_overp * 100) / ds_capacity \
+                if ds_capacity else 0
+            desc =  "\t{}: used {} of {}".format(summary.name, format_space(ds_used), format_space(ds_capacity))
+            desc += get_colored_percent(float(ds_used) / float(ds_capacity) * 100)
+            if ds_provisioned > ds_capacity:
+                desc += " %.0f%% over-provisioned" % ds_overp_pct
+            print desc
+
+
 def info( host):
     vm = find(host)
     print vm.summary
@@ -323,17 +431,12 @@ def start(vm):
 @cli.command()
 @click.argument('vm')
 def stop(vm):
-    print "deb"
-    print "stopping %s" % (vm)
-    import pdb
-    pdb.set_trace()
     for vm in all(vm):
         if (vm.runtime.powerState != 'poweredOff'):
             print "stopping " + vm.summary.config.name
             vm.PowerOff()
 
 @cli.command()
-
 @click.argument('vm')
 def restart( vm):
     for vm in all(vm):
@@ -346,14 +449,14 @@ def restart( vm):
 @cli.command()
 @click.argument('vm')
 
-def destroy( vm):
+def destroy(vm):
     for vm in all(vm):
         if (vm.runtime.powerState == 'poweredOn'):
             wait(vm.PowerOff())
         print "destroying " + vm.summary.config.name
         vm.Destroy_Task()
 
-def datastores( name=None):
+def datastores(name=None):
     datastores = {}
     content = esx.RetrieveContent()
     esxi_hosts = content.viewManager.CreateContainerView(content.rootFolder,
@@ -370,7 +473,7 @@ def datastores( name=None):
                     host_mount_info.volume.name] = host_mount_info.mountInfo.path
     return datastores
 
-def get_host( name):
+def get_host(name):
     return get_obj(vim.HostSystem, name)
 
 def get_network():
@@ -423,7 +526,7 @@ def find( vm):
     _vm = all(vm)
     _vm = sorted(_vm, reverse=False, key=lambda vm: vm.summary.config.name)
     for vm in _vm:
-        if vm.summary.guest.ipAddress != None:
+        if vm.summary.guest.ipAddress is not None:
             return vm
     if len(_vm) is 0:
         return None
@@ -432,22 +535,22 @@ def find( vm):
 def all(host=None):
     if isinstance(host, vim.VirtualMachine):
         return [host]
-    content = esx.RetrieveContent()
-    children = content.rootFolder.childEntity
-    list = []
-    for child in children:
-        if hasattr(child, 'vmFolder'):
-            datacenter = child
-        else:
-            # some other non-datacenter type object
-            continue
 
-        _appendChildren(list, datacenter.vmFolder.childEntity, host)
+    list = []
+    for content in get_esxi_hosts():
+        children = content.rootFolder.childEntity
+        for child in children:
+            if hasattr(child, 'vmFolder'):
+                datacenter = child
+            else:
+                # some other non-datacenter type object
+                continue
+
+            _appendChildren(list, datacenter.vmFolder.childEntity, host)
 
     return list
 
 def _appendChildren(list, vm_list, host):
-  
     for virtual_machine in vm_list:
         if (not isinstance(virtual_machine, vim.Folder) and (host is None or host is '' or virtual_machine.summary.config.name.startswith(host))):
             list.append(virtual_machine)
@@ -455,18 +558,18 @@ def _appendChildren(list, vm_list, host):
             _appendChildren(list, virtual_machine.childEntity, host)
 
 
-def format_mem( mem):
+def format_mem(mem):
     if mem is None:
         return ""
     return '{0:.2f}GB'.format(float(mem)/1024)
 
-def format_space( space):
+def format_space(space):
     if space is None:
         return ""
     return str(space/1024/1024/1024)+ "GB"
 
 
-def guest_exec( vm, cmd,args=None):
+def guest_exec(vm, cmd,args=None):
     content = esx.RetrieveContent()
     pm = content.guestOperationsManager.processManager
     print password
@@ -476,11 +579,12 @@ def guest_exec( vm, cmd,args=None):
     print res
 
 @cli.command()
-@click.argument('vm')
+@click.argument('name')
 @click.option('--size', help='size in GB of the new disk')
-def extend_disk(vm,size):
-    size =int(size)
-    vm = find(vm)
+def extend_disk(name, size):
+    size = int(size)
+    vm = find(name)
+    print "%s = %s " % (name, vm.summary.config.name)
     for d in vm.layout.disk:
         # if d.diskPath == '/boot':
             # continue
@@ -491,7 +595,9 @@ def extend_disk(vm,size):
         extend_by = new_capacity_in_kb * 1024 - total
         if extend_by < 1024:
             continue
-        stop(vm)
+        if (vm.runtime.powerState != 'poweredOff'):
+            print "stopping " + vm.summary.config.name
+            vm.PowerOff()
         vmdk = get_vm_path(vm)
         print "extending virtual disk %s from %s by %s to %s" % (vmdk, format_space(total), format_space(new_capacity_in_kb * 1024 - total), format_space(new_capacity_in_kb * 1024))
         wait(esx.content.virtualDiskManager.ExtendVirtualDisk(name=vmdk, datacenter=None, newCapacityKb=long(new_capacity_in_kb), eagerZero=False))
@@ -518,16 +624,15 @@ def extend_disk(vm,size):
 
     print "stopping %s" % vm
     vm.PowerOff()
-    ssh("vmkfstools -X %sG %s" % (size, get_vmdk(find(vm))))
+    ssh("vmkfstools -X %sG %s" % (size-1, get_vmdk(find(vm))))
     vm.PowerOn()
     print """
-    parted -a optimal /dev/sda3 mkpart primary 100%
-    partprobe
-    vgextend template-vg /dev/sda3  
-    lvextend -l +100%FREE /dev/template-vg/root 
-    resize2fs /dev/mapper/template--vg-root
+parted /dev/sda resizepart 2 100%
+parted /dev/sda resizepart 2 100%
+pvresize /dev/sda5
+lvresize /dev/template-vg/root -l 100%VG"
+resize2fs /dev/template-vg/root
     """
-
 
 @cli.command()
 @click.argument('vm')
