@@ -7,7 +7,7 @@ from optparse import OptionParser
 import click
 from datetime import datetime
 from colors import red, green, blue
-
+import string
 from colorama import init
 from termcolor import colored
 
@@ -85,8 +85,24 @@ def cli(ctx, host, username, password):
     _password = password
 
 
+def get_esxi_hosts():
+    global esx
+    esxi_hosts = []
+    for host in _host.split(" "):
+        esx = connect.SmartConnect(host=host,
+                                   sslContext=_create_unverified_https_context(),
+                                   user=_user,
+                                   pwd=_password,
+                                   port=443)
+
+        content = esx.RetrieveContent()
+        esxi_hosts.append(content)
+    return esxi_hosts
+
+
 def get_datacenter():
-    return esx.RetrieveContent().rootFolder.childEntity[0]
+    for esx in get_esxi_hosts():
+        return esx.rootFolder.childEntity[0]
 
 
 def get_resource_pool():
@@ -167,60 +183,9 @@ def add_disk_spec(scsi_ctr, name, size=50):
     return disk_spec
 
 
-@cli.command()
-def prep_template(name):
-    ssh("vmkfstools -K %s" % get_vmdk(find(name)))
-
-
 def get_vm_path(vm):
     datastore = vm.storage.perDatastoreUsage[0].datastore.info.name
     return "[%s] %s" % (datastore, vm.layout.disk[0].diskFile[0].split(" ")[1])
-
-
-@cli.command()
-@click.option('--name', help='name of the new vm')
-@click.option('--template', default="template", help='vm hostname')
-@click.option('--size', default=50, help='vm storage size in GB')
-@click.option('--datastore', default=None, help='datastore to use')
-def ghetto_clone(name, template, size, datastore):
-    dc = get_datacenter()
-    datastore = get_datastore_name(datastore)
-    if datastore is None:
-        return
-    vm_folder = dc.vmFolder
-    vmPathName = "[%s] %s" % (datastore, "")
-    vmx_file = vim.vm.FileInfo(
-        logDirectory=None, snapshotDirectory=None, suspendDirectory=None, vmPathName=vmPathName)
-
-    config = vim.vm.ConfigSpec(
-        name=name,
-        memoryMB=1024,
-        numCPUs=2,
-        files=vmx_file,
-        guestId="ubuntu64Guest",
-        version='vmx-07'
-    )
-
-    print_ok("Creating %s on %s/%s" % (name, dc, datastore) + "\n")
-    vm = wait(vm_folder.CreateVM_Task(
-        config=config, pool=get_resource_pool()), breakOnError=True)
-    print_ok("Created %s\n " % vm.summary.config.vmPathName)
-    vmdk = "[%s] %s/%s.vmdk" % (datastore, name, name)
-    print_ok("Attaching %s \n" % vmdk)
-    spec = get_default_spec(size=size, name=vmdk)
-    wait(vm.ReconfigVM_Task(spec=spec), breakOnError=True)
-    path = "/vmfs/volumes/%s/%s" % (datastore, name)
-    vmdk = get_vmdk(find(template))
-    ssh("rm %s/*.vmdk" % path)
-    ssh("vmkfstools -i %s %s -d thin" %
-        (vmdk, path + "/" + name + ".vmdk"))
-    wait(vm.PowerOn())
-
-    if get_ip(name) is None:
-        print "[%s] waiting for ip" % name
-        await(lambda: get_ip(name) is not None)
-    return get_ip(name)
-
 
 @cli.command()
 def clone(vm):
@@ -312,15 +277,12 @@ def wait(task, actionName='job', hideResult=False, breakOnError=False):
                        (actionName, task.info.error))
         return task.info.result
 
-
 def get_vmdk(vm):
     return vm.storage.perDatastoreUsage[0].datastore.info.url + "/" + vm.layout.disk[0].diskFile[0].split(" ")[1]
-
 
 def print_status_info(info):
     if not hasattr(info, 'name'):
         return
-    # print info
     color = 'grey'
     if (hasattr(info, 'healthState')):
         color = info.healthState.key
@@ -331,12 +293,11 @@ def print_status_info(info):
         color = 'grey'
     desc = info.name
     color = color.lower()
-    if 'green' in color:
+    if 'green' in color or 'grey' in color:
         return
     if hasattr(info, 'currentReading') and info.currentReading > 0:
         desc += " %.0f %s" % (10 ** info.unitModifier * info.currentReading, info.baseUnits)
     print colored(desc, color)
-
 
 def get_cpu_info(host):
     cpuName = host.hardware.cpuPkg[0].description
@@ -382,22 +343,6 @@ def get_tags(host):
         desc += info.identifierType.key + "=" + info.identifierValue + " "
     return desc
 
-
-def get_esxi_hosts():
-    global esx
-    esxi_hosts = []
-    for host in _host.split(" "):
-        esx = connect.SmartConnect(host=host,
-                                   sslContext=_create_unverified_https_context(),
-                                   user=_user,
-                                   pwd=_password,
-                                   port=443)
-
-        content = esx.RetrieveContent()
-        esxi_hosts.append(content)
-    return esxi_hosts
-
-
 def get_host_view(content):
     esx = content.viewManager.CreateContainerView(content.rootFolder,
                                                   [vim.HostSystem],
@@ -405,105 +350,8 @@ def get_host_view(content):
     atexit.register(connect.Disconnect, esx)
     return esx
 
-
-@cli.command()
-def status():
-    for content in get_esxi_hosts():
-        host = get_host_view(content)[0]
-        for health in host.runtime.healthSystemRuntime.systemHealthInfo.numericSensorInfo:
-            print_status_info(health)
-
-        print_status_info(host.runtime.healthSystemRuntime.hardwareStatusInfo.memoryStatusInfo[0])
-        print_status_info(host.runtime.healthSystemRuntime.hardwareStatusInfo.cpuStatusInfo[0])
-
-        print "%s (%s)\n\t%s\n\tCPU: %s\n\tRAM: %s" % (
-        blue(host.name), content.about.fullName, get_tags(host), get_cpu_info(host), get_mem_info(host))
-
-        datastores = content.viewManager.CreateContainerView(content.rootFolder, [vim.Datastore], True).view
-        for datastore in datastores:
-            summary = datastore.summary
-            ds_capacity = summary.capacity
-            ds_freespace = summary.freeSpace
-            ds_uncommitted = summary.uncommitted if summary.uncommitted else 0
-            ds_provisioned = ds_capacity - ds_freespace + ds_uncommitted
-            ds_used = ds_capacity - ds_freespace
-            ds_overp = ds_provisioned - ds_capacity
-            ds_overp_pct = (ds_overp * 100) / ds_capacity \
-                if ds_capacity else 0
-            desc = "\t{}: used {} of {}".format(summary.name, format_space(ds_used), format_space(ds_capacity))
-            desc += get_colored_percent(float(ds_used) / float(ds_capacity) * 100)
-            if ds_provisioned > ds_capacity:
-                desc += " %.0f%% over-provisioned" % ds_overp_pct
-            print desc
-
-
-def info(host):
-    vm = find(host)
-    print vm.summary
-    print vm.guest
-    print get_vmdk(vm)
-
-
-@cli.command()
-@click.argument('vm')
-def start(vm):
-    for vm in all(vm):
-        if (vm.runtime.powerState != 'poweredOn'):
-            print "starting " + vm.summary.config.name
-            vm.PowerOn()
-
-
-@cli.command()
-@click.argument('vm')
-def stop(vm):
-    for vm in all(vm):
-        if (vm.runtime.powerState != 'poweredOff'):
-            print "stopping " + vm.summary.config.name
-            vm.PowerOff()
-
-
-@cli.command()
-@click.argument('vm')
-def restart(vm):
-    for vm in all(vm):
-        if (vm.runtime.powerState == 'poweredOn'):
-            print "stopping " + vm.summary.config.name
-            wait(vm.PowerOff(), 'stop', True)
-        print "starting " + vm.summary.config.name
-        vm.PowerOn()
-
-
-@cli.command()
-@click.argument('vm')
-def destroy(vm):
-    for vm in all(vm):
-        if (vm.runtime.powerState == 'poweredOn'):
-            wait(vm.PowerOff())
-        print "destroying " + vm.summary.config.name
-        vm.Destroy_Task()
-
-
-def datastores(name=None):
-    datastores = {}
-    content = esx.RetrieveContent()
-    esxi_hosts = content.viewManager.CreateContainerView(content.rootFolder,
-                                                         [vim.HostSystem],
-                                                         True).view
-    for esxi_host in esxi_hosts:
-        storage_system = esxi_host.configManager.storageSystem
-        host_file_sys_vol_mount_info = \
-            storage_system.fileSystemVolumeInfo.mountInfo
-
-        for host_mount_info in host_file_sys_vol_mount_info:
-            if host_mount_info.volume.type == "VMFS":
-                datastores[
-                    host_mount_info.volume.name] = host_mount_info.mountInfo.path
-    return datastores
-
-
 def get_host(name):
     return get_obj(vim.HostSystem, name)
-
 
 def get_network():
     content = esx.RetrieveContent()
@@ -514,7 +362,6 @@ def get_network():
         obj = c
 
     return obj
-
 
 def get_hosts():
     hosts = []
@@ -540,18 +387,6 @@ def get_obj(vimtype, name):
             obj = c
             break
     return obj
-
-
-def convert_to_thin(vm, dir):
-    cmd = string.Template("""
-	vmkfstools -i $dir/$vm/disk.vmdk $dir/$vm/disk-thin.vmdk -d thin
-	rm disk-flat.vmdk 
-	mv disk-thin-flat.vmdk disk-flat.vmdk
-	vim-cmd vmsvc/unregister `vim-cmd vmsvc/getallvms | grep $vm | cut -d " " -f 1`
-	vim-cmd solo/registervm $dir/$vm/$vm.vmx
-	""").substitute(vm=vm, dir=dir)
-    ssh(cmd)
-
 
 def find(vm):
     if isinstance(vm, vim.VirtualMachine):
@@ -615,6 +450,82 @@ def guest_exec(vm, cmd, args=None):
     ps = vim.vm.guest.ProcessManager.ProgramSpec(programPath=cmd, arguments="args")
     res = pm.StartProgramInGuest(vm, creds, ps)
     print res
+
+
+@cli.command()
+@click.option('--name', help='name of the new vm')
+@click.option('--template', default="template", help='vm hostname')
+@click.option('--size', default=50, help='vm storage size in GB')
+@click.option('--datastore', default=None, help='datastore to use')
+def ghetto_clone(name, template, size, datastore):
+    dc = get_datacenter()
+    datastore = get_datastore_name(datastore)
+    if datastore is None:
+        return
+    vm_folder = dc.vmFolder
+    vmPathName = "[%s] %s" % (datastore, "")
+    vmx_file = vim.vm.FileInfo(
+        logDirectory=None, snapshotDirectory=None, suspendDirectory=None, vmPathName=vmPathName)
+
+    config = vim.vm.ConfigSpec(
+        name=name,
+        memoryMB=1024,
+        numCPUs=2,
+        files=vmx_file,
+        guestId="ubuntu64Guest",
+        version='vmx-07'
+    )
+
+    print_ok("Creating %s on %s/%s" % (name, dc, datastore) + "\n")
+    vm = wait(vm_folder.CreateVM_Task(
+        config=config, pool=get_resource_pool()), breakOnError=True)
+    print_ok("Created %s\n " % vm.summary.config.vmPathName)
+    vmdk = "[%s] %s/%s.vmdk" % (datastore, name, name)
+    print_ok("Attaching %s \n" % vmdk)
+    spec = get_default_spec(size=size, name=vmdk)
+    wait(vm.ReconfigVM_Task(spec=spec), breakOnError=True)
+    path = "/vmfs/volumes/%s/%s" % (datastore, name)
+    vmdk = get_vmdk(find(template))
+    ssh("rm %s/*.vmdk" % path)
+    ssh("vmkfstools -i %s %s -d thin" %
+        (vmdk, path + "/" + name + ".vmdk"))
+    wait(vm.PowerOn())
+
+    if get_ip(name) is None:
+        print "[%s] waiting for ip" % name
+        await(lambda: get_ip(name) is not None)
+    print "[%s] started with ip: " % get_ip(name)
+    return get_ip(name)
+
+@cli.command()
+def status():
+    for content in get_esxi_hosts():
+        host = get_host_view(content)[0]
+        for health in host.runtime.healthSystemRuntime.systemHealthInfo.numericSensorInfo:
+            print_status_info(health)
+
+        print_status_info(host.runtime.healthSystemRuntime.hardwareStatusInfo.memoryStatusInfo[0])
+        print_status_info(host.runtime.healthSystemRuntime.hardwareStatusInfo.cpuStatusInfo[0])
+
+        print "%s (%s)\n\t%s\n\tCPU: %s\n\tRAM: %s" % (
+        blue(host.name), content.about.fullName, get_tags(host), get_cpu_info(host), get_mem_info(host))
+
+        datastores = content.viewManager.CreateContainerView(content.rootFolder, [vim.Datastore], True).view
+        for datastore in datastores:
+            summary = datastore.summary
+            ds_capacity = summary.capacity
+            ds_freespace = summary.freeSpace
+            ds_uncommitted = summary.uncommitted if summary.uncommitted else 0
+            ds_provisioned = ds_capacity - ds_freespace + ds_uncommitted
+            ds_used = ds_capacity - ds_freespace
+            ds_overp = ds_provisioned - ds_capacity
+            ds_overp_pct = (ds_overp * 100) / ds_capacity \
+                if ds_capacity else 0
+            desc = "\t{}: used {} of {}".format(summary.name, format_space(ds_used), format_space(ds_capacity))
+            desc += get_colored_percent(float(ds_used) / float(ds_capacity) * 100)
+            if ds_provisioned > ds_capacity:
+                desc += " %.0f%% over-provisioned" % ds_overp_pct
+            print desc
 
 
 @cli.command()
@@ -744,28 +655,82 @@ def list(filter):
             pass
 
 
-def register(host):
-    execute_ssh(host=host, username=user, password=password,
-                cmd="vim-cmd solo/registervm  '%s'" % os.environ['vm_path'])
+@cli.command()
+@click.argument('host')
+def info(host):
+    vm = find(host)
+    print vm.summary
+    print vm.guest
+    print get_vmdk(vm)
 
 
 @cli.command()
-@click.pass_context
-def list_clusters(ctx):
-    content = esx.RetrieveContent()
-    # Search for all Datastore Clusters aka StoragePod
-    obj_view = content.viewManager.CreateContainerView(content.rootFolder,
-                                                       [vim.StoragePod],
-                                                       False)
-    ds_cluster_list = obj_view.view
+@click.argument('vm')
+def start(vm):
+    for vm in all(vm):
+        if (vm.runtime.powerState != 'poweredOn'):
+            print "starting " + vm.summary.config.name
+            vm.PowerOn()
 
-    for ds_cluster in ds_cluster_list:
-        print ds_cluster.name
-        datastores = ds_cluster.childEntity
-        print "Datastores: "
-        for datastore in datastores:
-            print datastore.name
 
+@cli.command()
+@click.argument('vm')
+def stop(vm):
+    for vm in all(vm):
+        if (vm.runtime.powerState != 'poweredOff'):
+            print "stopping " + vm.summary.config.name
+            vm.PowerOff()
+
+
+@cli.command()
+@click.argument('vm')
+def restart(vm):
+    for vm in all(vm):
+        if (vm.runtime.powerState == 'poweredOn'):
+            print "stopping " + vm.summary.config.name
+            wait(vm.PowerOff(), 'stop', True)
+        print "starting " + vm.summary.config.name
+        vm.PowerOn()
+
+
+@cli.command()
+@click.argument('vm')
+@click.option('--count', default=1, help='the total number of vms delete')
+def destroy(vm, count):
+    vms = all(vm)
+    for vm in vms:
+            print vm.name
+
+    if len(vms) != count:
+        print_fail("%s vm's filtered for deletion, %s authorised" % (len(vms), count))
+        return
+
+    print "Deleting %s vm's" % len(vms)
+    time.sleep(2)
+
+    for vm in vms:
+        if (vm.runtime.powerState == 'poweredOn'):
+            wait(vm.PowerOff())
+        print "destroying " + vm.summary.config.name
+        vm.Destroy_Task()
+
+
+@cli.command()
+@click.argument('host')
+def prep_template(host):
+    vm = find(host)
+    vmdk = get_vmdk(vm)
+    cmd = string.Template("""
+vmkfstools -i $vmdk $vmdk-thin -d thin
+rm $vmdk
+mv $vmdk-thin $vmdk
+    """).substitute(vmdk=vmdk, vm=vm.summary.config.name, vmx=vm.summary.config.vmPathName)
+    ssh(cmd)
+
+
+def register(host):
+    execute_ssh(host=host, username=user, password=password,
+                cmd="vim-cmd solo/registervm  '%s'" % os.environ['vm_path'])
 
 def main():
     cli()
