@@ -10,15 +10,15 @@ requirements = [
     'progressbar2',
     'termcolor',
     'colorama',
+    'mcommons'
 ]
 
 if os.name == 'posix':
     requirements.append('sh')
 
-
 setup(name = "esx-cli",
     install_requires = requirements,
-    version = "0.1",
+    version = "1.0",
     description = "A command line tool for managing vCenter and ESXi servers",
     author = "Moshe Immerman",
     author_email = 'name.surname@gmail.com',
@@ -28,7 +28,7 @@ setup(name = "esx-cli",
     packages = find_packages(),
     entry_points = {
         "console_scripts": [
-            "esx = esx_cli.ESX:main",
+            "esx = esx_cli.cli:main",
         ]
     }
 )
