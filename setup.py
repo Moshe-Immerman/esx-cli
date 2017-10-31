@@ -18,7 +18,7 @@ if os.name == 'posix':
 
 setup(name = "esx-cli",
     install_requires = requirements,
-    version = "1.0",
+    version = "1.1",
     description = "A command line tool for managing vCenter and ESXi servers",
     author = "Moshe Immerman",
     author_email = 'name.surname@gmail.com',

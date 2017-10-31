@@ -202,19 +202,19 @@ class ESX:
         )
 
         print_ok("Creating %s on %s/%s" % (name, dc, datastore) + "\n")
-        vm = wait(vm_folder.CreateVM_Task(
+        vm = wait_for(vm_folder.CreateVM_Task(
             config=config, pool=self.get_resource_pool()), breakOnError=True)
         print_ok("Created %s\n " % vm.summary.config.vmPathName)
         vmdk = "[%s] %s/%s.vmdk" % (datastore, name, name)
         print_ok("Attaching %s \n" % vmdk)
         spec = get_default_spec(size=size, name=vmdk, network=self.get_network())
-        wait(vm.ReconfigVM_Task(spec=spec), breakOnError=True)
+        wait_for(vm.ReconfigVM_Task(spec=spec), breakOnError=True)
         path = "/vmfs/volumes/%s/%s" % (datastore, name)
         vmdk = get_vmdk(self.find(template))
         self.ssh("rm %s/*.vmdk" % path)
         self.ssh("vmkfstools -i %s %s -d thin" %
             (vmdk, path + "/" + name + ".vmdk"))
-        wait(vm.PowerOn())
+        wait_for(vm.PowerOn())
 
         if self.get_ip(name) is None:
             print "[%s] waiting for ip" % name
@@ -271,7 +271,7 @@ class ESX:
             print "extending virtual disk %s from %s by %s to %s" % (
             vmdk, format_space(total), format_space(new_capacity_in_kb * 1024 - total),
             format_space(new_capacity_in_kb * 1024))
-            wait(esx.content.virtualDiskManager.ExtendVirtualDisk(name=vmdk, datacenter=None,
+            wait_for(esx.content.virtualDiskManager.ExtendVirtualDisk(name=vmdk, datacenter=None,
                                                                   newCapacityKb=long(new_capacity_in_kb), eagerZero=False))
             print "reconfiguring %s from %s by %s to %s" % (
             vm.name, format_space(total), format_space(new_capacity_in_kb * 1024 - total),
@@ -294,7 +294,7 @@ class ESX:
             dev_changes.append(disk_spec)
             spec = vim.vm.ConfigSpec()
             spec.deviceChange = dev_changes
-            wait(vm.ReconfigVM_Task(spec=spec))
+            wait_for(vm.ReconfigVM_Task(spec=spec))
 
             print "stopping %s" % vm
             vm.PowerOff()
@@ -314,10 +314,10 @@ class ESX:
         print "extending %s from %sGB to %sGB" % (vm.summary.config.name, vm.summary.config.memorySizeMB / 1024, size)
         spec = vim.vm.ConfigSpec()
         spec.memoryMB = size * 1024
-        wait(vm.ReconfigVM_Task(spec=spec))
+        wait_for(vm.ReconfigVM_Task(spec=spec))
 
 
-    def list(self, filter):
+    def list(self, filter, format):
         columns = [
             {"name": "host"},
             {"name": "name"},
@@ -331,10 +331,12 @@ class ESX:
             {"name": "disk_free", "type": "size"},
             {"name": "disk_capacity", "type": "size"}
         ]
-        table = Table(columns=columns)
+        table = Table.new(format, columns)
+        table.begin()
         for vm in self.list_vms(filter, table):
             table.append(vm)
-        table.print_frame()
+            table.print_frame()
+        table.end()
 
 
 
@@ -395,7 +397,7 @@ class ESX:
         for vm in self.all(vm):
             if (vm.runtime.powerState == 'poweredOn'):
                 print "stopping " + vm.summary.config.name
-                wait(vm.PowerOff(), 'stop', True)
+                wait_for(vm.PowerOff(), 'stop', True)
             print "starting " + vm.summary.config.name
             vm.PowerOn()
 
@@ -414,7 +416,7 @@ class ESX:
 
         for vm in vms:
             if (vm.runtime.powerState == 'poweredOn'):
-                wait(vm.PowerOff())
+                wait_for(vm.PowerOff())
             print "destroying " + vm.summary.config.name
             vm.Destroy_Task()
 
@@ -430,13 +432,12 @@ class ESX:
         self.ssh(cmd)
 
 
-
 def get_vm_path(vm):
     datastore = vm.storage.perDatastoreUsage[0].datastore.info.name
     return "[%s] %s" % (datastore, vm.layout.disk[0].diskFile[0].split(" ")[1])
 
 
-def wait(task, actionName='job', hideResult=False, breakOnError=False):
+def wait_for(task, actionName='job', hideResult=False, breakOnError=False):
     while task.info.state == vim.TaskInfo.State.running:
         time.sleep(2)
 
@@ -502,6 +503,7 @@ def get_mem_info(host):
     )
     return "%s %s" % (format_space(memoryCapacity), get_colored_percent(percentage))
 
+
 def get_tags(host):
     desc = ""
     for info in host.hardware.systemInfo.otherIdentifyingInfo:
@@ -509,6 +511,7 @@ def get_tags(host):
             continue
         desc += info.identifierType.key + "=" + info.identifierValue + " "
     return desc
+
 
 def get_host_view(content):
     esx = content.viewManager.CreateContainerView(content.rootFolder,

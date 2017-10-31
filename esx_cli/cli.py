@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 import click
-from esx import ESX
+from ESX import ESX
 
 
 esx = None
@@ -44,8 +44,10 @@ def increase_mem(vm, size):
 
 @cli.command()
 @click.argument('filter', required=False)
-def list(filter):
-    esx.list(filter)
+@click.option('--format', default="pretty", help="pretty, json or CSV")
+def list(filter, format):
+    print "listing"
+    esx.list(filter, format)
 
 
 @cli.command()
